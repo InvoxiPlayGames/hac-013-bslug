@@ -45,11 +45,16 @@
 #include <rvl/cache.h>
 #include <rvl/ipc.h>
 #include <rvl/Pad.h>
+#include <stdbool.h>
+
+void printf(const char * format, ...);
+static int sendRumble(void);
+void VIResetDimmingCount(void);
 
 BSLUG_MODULE_GAME("????");
-BSLUG_MODULE_NAME("USB GCN Adapter Support");
+BSLUG_MODULE_NAME("Switch Pro Controller Support");
 BSLUG_MODULE_VERSION("v1.0");
-BSLUG_MODULE_AUTHOR("Chadderz");
+BSLUG_MODULE_AUTHOR("InvoxiPlayGames");
 BSLUG_MODULE_LICENSE("BSD");
 
 /*============================================================================*/
@@ -70,13 +75,16 @@ BSLUG_MODULE_LICENSE("BSD");
 /* How long (in time base units) to go without inputs before reporting a disconnect. */
 #define ms * (243000/4)
 #define GCN_TIMEOUT (1500 ms)
-/* Commands that the adapter supports. */
-#define WUP_028_CMD_RUMBLE 0x11
-#define WUP_028_CMD_INIT 0x13
-/* VendorID and ProductID of the adatper. */
-#define WUP_028_ID 0x057e0337
-/* Size of the controller data returned by the adapter. */
-#define WUP_028_POLL_SIZE 0x25
+/* Commands that the adapter controller. */
+#define HAC_013_CMD_PREFIX 0x80
+#define HAC_013_CMD_RUMBLE 0x11
+#define HAC_013_CMD_MAC 0x01
+#define HAC_013_CMD_HANDSHAKE 0x02
+#define HAC_013_CMD_HID 0x04
+/* VendorID and ProductID of the controller. */
+#define HAC_013_ID 0x057e2009
+/* Size of the data returned by the controller. */
+#define HAC_013_POLL_SIZE 0x40
 /* Size of the rumble message circular buffer. */
 #define RUMBLE_BUFFER 16
 /* Number of polls to wait before giving up on outstanding rumble command. */
@@ -91,7 +99,6 @@ BSLUG_MODULE_LICENSE("BSD");
 static ios_fd_t dev_usb_hid_fd = -1;
 static int8_t started = 0;
 static PADData_t gcn_data[GCN_CONTROLLER_COUNT];
-static uint32_t gcn_data_written;
 static uint32_t gcn_adapter_id = -1;
 #if defined(SUPPORT_DEV_USB_HID5) && defined(SUPPORT_DEV_USB_HID4)
 #define HAVE_VERSION
@@ -99,34 +106,25 @@ static int8_t version;
 #endif
 int8_t error;
 int8_t errorMethod;
-/* Circular buffer of rumble outputs. */
-static uint8_t rumble_sent = 0;
-static uint8_t rumble_recv = 0;
-static uint8_t rumble_buffer[RUMBLE_BUFFER][GCN_CONTROLLER_COUNT];
-/* Don't send next rumble until old one returns or timeout passes. */
-static uint8_t rumble_delay;
-static uint8_t rumble_token;
+int8_t lastCommand;
 /* Messages for device. */
-static uint8_t init_msg_buffer[1] IOS_ALIGN = { WUP_028_CMD_INIT };
+static uint8_t handshake_msg_buffer[2] IOS_ALIGN = { HAC_013_CMD_PREFIX, HAC_013_CMD_HANDSHAKE };
+static uint8_t hid_msg_buffer[2] IOS_ALIGN = { HAC_013_CMD_PREFIX, HAC_013_CMD_HID };
+static uint8_t rumble_msg_buffer[10] IOS_ALIGN = { 0x10, 0x0F, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00 };
+static uint8_t led_msg_buffer[12] IOS_ALIGN = { 0x01, 0x0F, 0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40, 0x30, 0x02 };
 /* Pad buffer size to cache line size of IOS core. Otherwise IOS will write ver
  * later data, or we could read a stale value. */
-static uint8_t poll_msg_buffer[-(-WUP_028_POLL_SIZE & ~0x1f)] IOS_ALIGN;
-static uint8_t rumble_msg_buffer[1 + GCN_CONTROLLER_COUNT] IOS_ALIGN =
-  { WUP_028_CMD_RUMBLE };
+static uint8_t poll_msg_buffer[-(-HAC_013_POLL_SIZE & ~0x1f)] IOS_ALIGN;
 
 /*============================================================================*/
 /* Top level interface to game */
 /*============================================================================*/
 
-static uint32_t mftb(void);
+//static uint32_t mftb(void);
 static uint32_t cpu_isr_disable(void);
 static void cpu_isr_restore(uint32_t isr);
 static void onDevOpen(ios_fd_t fd, usr_t unused);
 
-static void myPADInit(void) {
-  /* FIXME: Until we've killed all PAD methods, better init still. */
-  PADInit();
-}
 static void myPADRead(PADData_t result[GCN_CONTROLLER_COUNT]) {
   uint32_t isr = cpu_isr_disable();
   if (!started) {
@@ -134,15 +132,12 @@ static void myPADRead(PADData_t result[GCN_CONTROLLER_COUNT]) {
     started = 1;
     for (int i = 0; i < GCN_CONTROLLER_COUNT; i++)
       gcn_data[i].error = PADData_ERROR_NO_CONNECTION;
-    gcn_data_written = mftb();
+    //gcn_data_written = mftb();
     IOS_OpenAsync(DEV_USB_HID_PATH, 0, onDevOpen, NULL);
   }
   if (errorMethod > 0) {
     /* On a USB error, disconnect all controllers. */
     errorMethod = -errorMethod;
-    for (int i = 0; i < GCN_CONTROLLER_COUNT; i++)
-      gcn_data[i].error = PADData_ERROR_NO_CONNECTION;
-  } else if (mftb() - gcn_data_written > GCN_TIMEOUT) {
     for (int i = 0; i < GCN_CONTROLLER_COUNT; i++)
       gcn_data[i].error = PADData_ERROR_NO_CONNECTION;
   }
@@ -154,25 +149,23 @@ static void myPADRead(PADData_t result[GCN_CONTROLLER_COUNT]) {
   }
   cpu_isr_restore(isr);
 }
+
 static void myPADControlMotor(int pad, int control) {
-  /* Check for valid pad. */
-  if ((unsigned int)pad >= GCN_CONTROLLER_COUNT) return;
-  uint32_t isr = cpu_isr_disable();
-  unsigned int prev = (unsigned int)(rumble_sent - 1) % RUMBLE_BUFFER;
-  /* Check if this command is redundant. */
-  if (rumble_buffer[prev][pad] == (uint8_t)control) goto exit;
-  /* Put this rumble command into a queue. */
-  for (int i = 0; i < GCN_CONTROLLER_COUNT; i++)
-    if (i == pad)
-      rumble_buffer[rumble_sent][i] = control;
-    else
-      rumble_buffer[rumble_sent][i] = rumble_buffer[prev][i];
-  rumble_sent = (rumble_sent + 1) % RUMBLE_BUFFER;
-exit:
-  cpu_isr_restore(isr);
+  if (pad > 0) return;
+  printf("Control motor: %i\n", control);
+  if (control > 1) control = 0;
+  lastCommand = control;
+  DCFlushRange(rumble_msg_buffer, sizeof(rumble_msg_buffer));
+  rumble_msg_buffer[3] = (control == 1 ? 0x20 : 0x00);
+  rumble_msg_buffer[4] = (control == 1 ? 0x62 : 0x00);
+  rumble_msg_buffer[5] = (control == 1 ? 0x10 : 0x00);
+  rumble_msg_buffer[6] = (control == 1 ? 0x98 : 0x80);
+  rumble_msg_buffer[7] = (control == 1 ? 0x20 : 0x00);
+  rumble_msg_buffer[8] = (control == 1 ? 0x62 : 0x00);
+  rumble_msg_buffer[9] = (control == 1 ? 0x10 : 0x00);
+  sendRumble();
 }
 
-BSLUG_MUST_REPLACE(PADInit, myPADInit);
 BSLUG_MUST_REPLACE(PADRead, myPADRead);
 BSLUG_REPLACE(PADControlMotor, myPADControlMotor);
 
@@ -180,11 +173,6 @@ BSLUG_REPLACE(PADControlMotor, myPADControlMotor);
 /* USB support */
 /*============================================================================*/
 
-static uint32_t mftb(void) {
-  uint32_t result;
-  asm volatile ("mftb %0" : "=r"(result));
-  return result;
-}
 static uint32_t cpu_isr_disable(void) {
   uint32_t isr, tmp;
   asm volatile("mfmsr %0; rlwinm %1, %0, 0, 0xFFFF7FFF; mtmsr %1" : "=r"(isr), "=r"(tmp));
@@ -214,10 +202,10 @@ static void onDevUsbPoll(ios_ret_t ret, usr_t unused);
    */
 
   /* Size of the adapter's description. */
-# define WUP_028_DESCRIPTOR_SIZE 0x44
+# define HAC_013_DESCRIPTOR_SIZE 0x44
   /* Endpoint numbering for the device. */
-# define WUP_028_ENDPOINT_OUT 0x2
-# define WUP_028_ENDPOINT_IN 0x81
+# define HAC_013_ENDPOINT_OUT 0x1
+# define HAC_013_ENDPOINT_IN 0x81
   /* Size of the DeviceChange ioctl's return (in words). */
 # define DEV_USB_HID4_DEVICE_CHANGE_SIZE 0x180
   /* IOCTL numbering for the device. */
@@ -237,25 +225,39 @@ struct interrupt_msg4 {
   void *ptr;
 };
 
-static struct interrupt_msg4 init_msg4 IOS_ALIGN = {
+static struct interrupt_msg4 handshake_msg4 IOS_ALIGN = {
   .device = -1,
-  .endpoint = WUP_028_ENDPOINT_OUT,
-  .length = sizeof(init_msg_buffer),
-  .ptr = init_msg_buffer
+  .endpoint = HAC_013_ENDPOINT_OUT,
+  .length = sizeof(handshake_msg_buffer),
+  .ptr = handshake_msg_buffer
 };
 
-static struct interrupt_msg4 poll_msg4 IOS_ALIGN = {
+static struct interrupt_msg4 hid_msg4 IOS_ALIGN = {
   .device = -1,
-  .endpoint = WUP_028_ENDPOINT_IN,
-  .length = WUP_028_POLL_SIZE,
-  .ptr = poll_msg_buffer
+  .endpoint = HAC_013_ENDPOINT_OUT,
+  .length = sizeof(hid_msg_buffer),
+  .ptr = hid_msg_buffer
 };
 
 static struct interrupt_msg4 rumble_msg4 IOS_ALIGN = {
   .device = -1,
-  .endpoint = WUP_028_ENDPOINT_OUT,
+  .endpoint = HAC_013_ENDPOINT_OUT,
   .length = sizeof(rumble_msg_buffer),
   .ptr = rumble_msg_buffer
+};
+
+static struct interrupt_msg4 led_msg4 IOS_ALIGN = {
+  .device = -1,
+  .endpoint = HAC_013_ENDPOINT_OUT,
+  .length = sizeof(led_msg_buffer),
+  .ptr = led_msg_buffer
+};
+
+static struct interrupt_msg4 poll_msg4 IOS_ALIGN = {
+  .device = -1,
+  .endpoint = HAC_013_ENDPOINT_IN,
+  .length = HAC_013_POLL_SIZE,
+  .ptr = poll_msg_buffer
 };
 
 static void onDevGetVersion4(ios_ret_t ret, usr_t unused);
@@ -277,12 +279,38 @@ static int getDeviceChange4(ios_cb_t cb, usr_t data) {
     cb, data
   );
 }
-
-static int sendInit4(ios_cb_t cb, usr_t data) {
-  init_msg4.device = gcn_adapter_id;
+static int sendHandshake4(ios_cb_t cb, usr_t data) {
+  handshake_msg4.device = gcn_adapter_id;
   return IOS_IoctlAsync(
     dev_usb_hid_fd, DEV_USB_HID4_IOCTL_INTERRUPT_OUT,
-    &init_msg4, sizeof(init_msg4),
+    &handshake_msg4, sizeof(handshake_msg4),
+    NULL, 0,
+    cb, data
+  );
+}
+static int sendHid4(ios_cb_t cb, usr_t data) {
+  hid_msg4.device = gcn_adapter_id;
+  return IOS_IoctlAsync(
+    dev_usb_hid_fd, DEV_USB_HID4_IOCTL_INTERRUPT_OUT,
+    &hid_msg4, sizeof(hid_msg4),
+    NULL, 0,
+    cb, data
+  );
+}
+static int sendRumble4(ios_cb_t cb, usr_t data) {
+  rumble_msg4.device = gcn_adapter_id;
+  return IOS_IoctlAsync(
+    dev_usb_hid_fd, DEV_USB_HID4_IOCTL_INTERRUPT_OUT,
+    &rumble_msg4, sizeof(rumble_msg4),
+    NULL, 0,
+    cb, data
+  );
+}
+static int sendLed4(ios_cb_t cb, usr_t data) {
+  led_msg4.device = gcn_adapter_id;
+  return IOS_IoctlAsync(
+    dev_usb_hid_fd, DEV_USB_HID4_IOCTL_INTERRUPT_OUT,
+    &led_msg4, sizeof(led_msg4),
     NULL, 0,
     cb, data
   );
@@ -294,17 +322,6 @@ static int sendPoll4(ios_cb_t cb, usr_t data) {
   return IOS_IoctlAsync(
     dev_usb_hid_fd, DEV_USB_HID4_IOCTL_INTERRUPT_IN,
     &poll_msg4, sizeof(poll_msg4),
-    NULL, 0,
-    cb, data
-  );
-}
-
-static int sendRumble4(ios_cb_t cb, usr_t data) {
-  DCFlushRange(rumble_msg_buffer, 0x20);
-  rumble_msg4.device = gcn_adapter_id;
-  return IOS_IoctlAsync(
-    dev_usb_hid_fd, DEV_USB_HID4_IOCTL_INTERRUPT_OUT,
-    &rumble_msg4, sizeof(rumble_msg4),
     NULL, 0,
     cb, data
   );
@@ -439,10 +456,10 @@ static int sendParams5(ios_cb_t cb, usr_t data) {
   );
 }
 
-static int sendInit5(ios_cb_t cb, usr_t data) {
+static int sendHandshake5(ios_cb_t cb, usr_t data) {
   /* Assumes buffer already set up */
   dev_usb_hid5_argv[0] = (ioctlv){dev_usb_hid5_buffer, 0x40};
-  dev_usb_hid5_argv[1] = (ioctlv){init_msg_buffer, sizeof(init_msg_buffer)};
+  dev_usb_hid5_argv[1] = (ioctlv){handshake_msg_buffer, sizeof(handshake_msg_buffer)};
   return IOS_IoctlvAsync(
     dev_usb_hid_fd, DEV_USB_HID5_IOCTL_INTERRUPT,
     2, 0, dev_usb_hid5_argv,
@@ -450,13 +467,13 @@ static int sendInit5(ios_cb_t cb, usr_t data) {
   );
 }
 
-static int sendPoll5(ios_cb_t cb, usr_t data) {
+static int sendHid5(ios_cb_t cb, usr_t data) {
   /* Assumes buffer already set up */
-  dev_usb_hid5_poll_argv[0] = (ioctlv){dev_usb_hid5_buffer+0x10, 0x40};
-  dev_usb_hid5_poll_argv[1] = (ioctlv){poll_msg_buffer, WUP_028_POLL_SIZE};
+  dev_usb_hid5_argv[0] = (ioctlv){dev_usb_hid5_buffer, 0x40};
+  dev_usb_hid5_argv[1] = (ioctlv){hid_msg_buffer, sizeof(hid_msg_buffer)};
   return IOS_IoctlvAsync(
     dev_usb_hid_fd, DEV_USB_HID5_IOCTL_INTERRUPT,
-    1, 1, dev_usb_hid5_poll_argv,
+    2, 0, dev_usb_hid5_argv,
     cb, data
   );
 }
@@ -468,6 +485,28 @@ static int sendRumble5(ios_cb_t cb, usr_t data) {
   return IOS_IoctlvAsync(
     dev_usb_hid_fd, DEV_USB_HID5_IOCTL_INTERRUPT,
     2, 0, dev_usb_hid5_argv,
+    cb, data
+  );
+}
+
+static int sendLed5(ios_cb_t cb, usr_t data) {
+  /* Assumes buffer already set up */
+  dev_usb_hid5_argv[0] = (ioctlv){dev_usb_hid5_buffer, 0x40};
+  dev_usb_hid5_argv[1] = (ioctlv){led_msg_buffer, sizeof(led_msg_buffer)};
+  return IOS_IoctlvAsync(
+    dev_usb_hid_fd, DEV_USB_HID5_IOCTL_INTERRUPT,
+    2, 0, dev_usb_hid5_argv,
+    cb, data
+  );
+}
+
+static int sendPoll5(ios_cb_t cb, usr_t data) {
+  /* Assumes buffer already set up */
+  dev_usb_hid5_poll_argv[0] = (ioctlv){dev_usb_hid5_buffer+0x10, 0x40};
+  dev_usb_hid5_poll_argv[1] = (ioctlv){poll_msg_buffer, HAC_013_POLL_SIZE};
+  return IOS_IoctlvAsync(
+    dev_usb_hid_fd, DEV_USB_HID5_IOCTL_INTERRUPT,
+    1, 1, dev_usb_hid5_poll_argv,
     cb, data
   );
 }
@@ -485,7 +524,8 @@ static void onError(void) {
 /*============================================================================*/
 
 static void onDevOpen(ios_fd_t fd, usr_t unused) {
-  int ret;
+  printf("Opening IOS...\n");
+  uint32_t ret;
   (void)unused;
   dev_usb_hid_fd = fd;
   if (fd >= 0)
@@ -500,6 +540,7 @@ static void onDevOpen(ios_fd_t fd, usr_t unused) {
   else
     ret = fd;
   if (ret) {
+    printf("Error opening IOS %i\n", ret);
     error = ret;
     errorMethod = 1;
   }
@@ -559,15 +600,18 @@ static void onDevUsbChange4(ios_ret_t ret, usr_t unused) {
     for (int i = 0; i < DEV_USB_HID4_DEVICE_CHANGE_SIZE && dev_usb_hid4_devices[i] < sizeof(dev_usb_hid4_devices); i += dev_usb_hid4_devices[i] / 4) {
       uint32_t device_id = dev_usb_hid4_devices[i + 1];
       if (
-        dev_usb_hid4_devices[i] == WUP_028_DESCRIPTOR_SIZE
-        && dev_usb_hid4_devices[i + 4] == WUP_028_ID
+        //dev_usb_hid4_devices[i] == HAC_013_DESCRIPTOR_SIZE &&
+        dev_usb_hid4_devices[i + 4] == HAC_013_ID
+        //true
       ) {
         found = 1;
         if (gcn_adapter_id != device_id) {
           gcn_adapter_id = device_id;
-          sendInit4(onDevUsbInit, NULL);
+          onDevUsbInit(0, NULL);
         }
         break;
+      } else {
+        printf("Device not found. %x\n", dev_usb_hid4_devices[i + 4]);
       }
     }
     if (!found) gcn_adapter_id = (uint32_t)-1;
@@ -601,7 +645,7 @@ static void onDevUsbAttach5(ios_ret_t ret, usr_t vcount) {
     int count = (int)vcount;
     for (int i = 0; i < DEV_USB_HID5_DEVICE_CHANGE_SIZE && i < count; i++) {
       uint32_t device_id = dev_usb_hid5_devices[i].id;
-      if (dev_usb_hid5_devices[i].vid_pid == WUP_028_ID) {
+      if (dev_usb_hid5_devices[i].vid_pid == HAC_013_ID) {
         found = 1;
         if (gcn_adapter_id != device_id) {
           gcn_adapter_id = device_id;
@@ -664,7 +708,7 @@ static void onDevUsbParams5(ios_ret_t ret, usr_t unused) {
     dev_usb_hid5_buffer[29] = 0;
     dev_usb_hid5_buffer[30] = 0;
     dev_usb_hid5_buffer[31] = 0;
-    ret = sendInit5(onDevUsbInit, NULL);
+    onDevUsbInit(0, NULL);
   }
   if (ret) {
     error = ret;
@@ -674,40 +718,7 @@ static void onDevUsbParams5(ios_ret_t ret, usr_t unused) {
 }
 #endif
 
-static void onRumble(ios_ret_t ret, usr_t token) {
-  (void)ret;
-  uint32_t isr = cpu_isr_disable();
-  if ((usr_t)(uint32_t)rumble_token == token)
-    rumble_delay = 0;
-  cpu_isr_restore(isr);
-}
-
 static int sendPoll(void) {
-  if (rumble_sent != rumble_recv) {
-    uint32_t isr = cpu_isr_disable();
-    if (rumble_delay == 0) {
-      for (int i = 0; i < GCN_CONTROLLER_COUNT; i++)
-        rumble_msg_buffer[i + 1] = rumble_buffer[rumble_recv][i];
-      rumble_recv = (rumble_recv + 1) % RUMBLE_BUFFER;
-      rumble_delay = RUMBLE_DELAY;
-      rumble_token++;
-    } else
-      rumble_delay--;
-    cpu_isr_restore(isr);
-
-#ifdef SUPPORT_DEV_USB_HID5
-#ifdef HAVE_VERSION
-    if (version == 5)
-#endif
-    sendRumble5(onRumble, (usr_t)(uint32_t)rumble_token);
-#endif
-#ifdef SUPPORT_DEV_USB_HID4
-#ifdef HAVE_VERSION
-    if (version == 4)
-#endif
-    sendRumble4(onRumble, (usr_t)(uint32_t)rumble_token);
-#endif
-  }
 #ifdef SUPPORT_DEV_USB_HID5
 #ifdef HAVE_VERSION
   if (version == 5)
@@ -723,11 +734,77 @@ static int sendPoll(void) {
   return -1;
 }
 
+static int sendHandshake() {
+#ifdef SUPPORT_DEV_USB_HID5
+#ifdef HAVE_VERSION
+  if (version == 5)
+#endif
+  return sendHandshake5(callbackIgnore, NULL);
+#endif
+#ifdef SUPPORT_DEV_USB_HID4
+#ifdef HAVE_VERSION
+  if (version == 4)
+#endif
+  return sendHandshake4(callbackIgnore, NULL);
+#endif
+  return -1;
+}
+
+static int sendHid() {
+#ifdef SUPPORT_DEV_USB_HID5
+#ifdef HAVE_VERSION
+  if (version == 5)
+#endif
+  return sendHid5(callbackIgnore, NULL);
+#endif
+#ifdef SUPPORT_DEV_USB_HID4
+#ifdef HAVE_VERSION
+  if (version == 4)
+#endif
+  return sendHid4(callbackIgnore, NULL);
+#endif
+  return -1;
+}
+
+static int sendRumble(void) {
+#ifdef SUPPORT_DEV_USB_HID5
+#ifdef HAVE_VERSION
+  if (version == 5)
+#endif
+  return sendRumble5(callbackIgnore, NULL);
+#endif
+#ifdef SUPPORT_DEV_USB_HID4
+#ifdef HAVE_VERSION
+  if (version == 4)
+#endif
+  return sendRumble4(callbackIgnore, NULL);
+#endif
+  return -1;
+}
+
+static int sendLed(void) {
+#ifdef SUPPORT_DEV_USB_HID5
+#ifdef HAVE_VERSION
+  if (version == 5)
+#endif
+  return sendLed5(callbackIgnore, NULL);
+#endif
+#ifdef SUPPORT_DEV_USB_HID4
+#ifdef HAVE_VERSION
+  if (version == 4)
+#endif
+  return sendLed4(callbackIgnore, NULL);
+#endif
+  return -1;
+}
+
 static void onDevUsbInit(ios_ret_t ret, usr_t unused) {
   if (ret >= 0) {
+    printf("USB init\n");
     ret = sendPoll();
   }
   if (ret) {
+    printf("Error on USB Init %i\n", ret);
     error = ret;
     errorMethod = 8;
     gcn_adapter_id = -1;
@@ -736,43 +813,74 @@ static void onDevUsbInit(ios_ret_t ret, usr_t unused) {
 
 static void onDevUsbPoll(ios_ret_t ret, usr_t unused) {
   if (ret >= 0) {
-    if (poll_msg_buffer[0] == 0x21) {
+    //printf("MSG: %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+    //poll_msg_buffer[0], poll_msg_buffer[1], poll_msg_buffer[2], poll_msg_buffer[3], poll_msg_buffer[4],
+    //poll_msg_buffer[5], poll_msg_buffer[6], poll_msg_buffer[7], poll_msg_buffer[8], poll_msg_buffer[9],
+    //poll_msg_buffer[10], poll_msg_buffer[11], poll_msg_buffer[12], poll_msg_buffer[13], poll_msg_buffer[14]);
+    if (poll_msg_buffer[0] != 0x30) {
+      if (poll_msg_buffer[0] == 0x81) {
+        switch (poll_msg_buffer[1]) {
+          case 0x01:
+            printf("Starting handshake...\n");
+            sendHandshake();
+            break;
+          case 0x02:
+            printf("Establishing HID...\n");
+            sendHid();
+            break;
+          case 0x04:
+            printf("HID established...\n");
+            sendLed();
+            break;
+        }
+      }
+      ret = 0;
+    } else {
       uint32_t isr = cpu_isr_disable();
       for (int i = 0; i < GCN_CONTROLLER_COUNT; i++) {
-        uint8_t *data = poll_msg_buffer + (i * 9 + 1);
-        if ((data[0] >> 4) != 1 && (data[0] >> 4) != 2) {
+        if (i >= 1) {
           gcn_data[i].error = PADData_ERROR_NO_CONNECTION;
           continue;
         }
+        uint8_t *data = poll_msg_buffer + 2;
+        uint8_t *analog = poll_msg_buffer + 6;
+        int8_t lx = (((analog[1] & 0x0F) << 4) | ((analog[0] & 0xF0) >> 4)) + 127;
+        int8_t ly = analog[2] + 127;
+        int8_t rx = (((analog[4] & 0x0F) << 4) | ((analog[3] & 0xF0) >> 4)) + 127;
+        int8_t ry = analog[5] + 127;
+        uint32_t buttondata = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
         gcn_data[i].buttons =
-          ((data[1] >> 0) & 1 ? PADData_BUTTON_A : 0) |
-          ((data[1] >> 1) & 1 ? PADData_BUTTON_B : 0) |
-          ((data[1] >> 2) & 1 ? PADData_BUTTON_X : 0) |
-          ((data[1] >> 3) & 1 ? PADData_BUTTON_Y : 0) |
-          ((data[1] >> 4) & 1 ? PADData_BUTTON_DL : 0) |
-          ((data[1] >> 5) & 1 ? PADData_BUTTON_DR : 0) |
-          ((data[1] >> 6) & 1 ? PADData_BUTTON_DD : 0) |
-          ((data[1] >> 7) & 1 ? PADData_BUTTON_DU : 0) |
-          ((data[2] >> 0) & 1 ? PADData_BUTTON_S : 0) |
-          ((data[2] >> 1) & 1 ? PADData_BUTTON_Z : 0) |
-          (data[7] >= GCN_TRIGGER_THRESHOLD ? PADData_BUTTON_L : 0) |
-          (data[8] >= GCN_TRIGGER_THRESHOLD ? PADData_BUTTON_R : 0);
-        gcn_data[i].aStickX = data[3] - 128;
-        gcn_data[i].aStickY = data[4] - 128;
-        gcn_data[i].cStickX = data[5] - 128;
-        gcn_data[i].cStickY = data[6] - 128;
-        gcn_data[i].sliderL = data[7];
-        gcn_data[i].sliderR = data[8];
+          (buttondata & 0x00000800 ? PADData_BUTTON_A : 0) |
+          (buttondata & 0x00000400 ? PADData_BUTTON_B : 0) |
+          (buttondata & 0x00000200 ? PADData_BUTTON_X : 0) |
+          (buttondata & 0x00000100 ? PADData_BUTTON_Y : 0) |
+          (buttondata & 0x08000000 ? PADData_BUTTON_DL : 0) |
+          (buttondata & 0x04000000 ? PADData_BUTTON_DR : 0) |
+          (buttondata & 0x01000000 ? PADData_BUTTON_DD : 0) |
+          (buttondata & 0x02000000 ? PADData_BUTTON_DU : 0) |
+          (buttondata & 0x00020000 ? PADData_BUTTON_S : 0) |
+          (buttondata & 0x00008000 ? PADData_BUTTON_Z : 0) |
+          (buttondata & 0x40000000 ? PADData_BUTTON_L : 0) |
+          (buttondata & 0x00004000 ? PADData_BUTTON_R : 0);
+        gcn_data[i].aStickX = lx;
+        gcn_data[i].aStickY = ly;
+        gcn_data[i].cStickX = rx;
+        gcn_data[i].cStickY = ry;
+        gcn_data[i].sliderL = (buttondata & 0x40000000 ? 0xFF : 0);
+        gcn_data[i].sliderR = (buttondata & 0x00004000 ? 0xFF : 0);
         gcn_data[i]._unknown8 = 0;
         gcn_data[i]._unknown9 = 0;
         gcn_data[i].error = 0;
+        //printf("Buttons: %08x - LX: %02x, LY: %02x - RX: %02x, RY: %02x", buttondata, lx, ly, rx, ry);
       }
-      gcn_data_written = mftb();
+      //gcn_data_written = mftb();
+      VIResetDimmingCount();
       cpu_isr_restore(isr);
     }
     ret = sendPoll();
   }
   if (ret) {
+    printf("Error reading: %i", ret);
     error = ret;
     errorMethod = 9;
     gcn_adapter_id = -1;
